@@ -23,7 +23,7 @@ def print_solution(solution):
     for agent, plan in solution.paths.items():
         print("Path for agent_" + str(agent) + ": ")
         for movement in plan.path:
-            print(movement[1], end="")
+            print(movement, end="")
             if plan.path[-1] != movement:
                 print(" --> ", end="")
         print()
@@ -41,21 +41,24 @@ def run_exp(test_map, max_agent, time_uncertainty, task_uncertainty, time_limit,
     test_map.generate_agents_with_subgoals(max_agent, 3)
     test_map.generate_subgoal_action_time(uncertainty=task_uncertainty)
     test_map.fill_heuristic_table_with_goal_list()
-
+    agent_subgoals = {agent_id: [goals[i] for i in range(len(goals)-1)] for agent_id, goals in test_map.goal_positions.items()}
+    print(agent_subgoals)
+    print(test_map.subgoal_action_time)
+    
     print("////////// CBSTU_TDU_PC //////////")
 
     cbsttu_planner = CBSTTU_Planner(test_map)
     #print("time_limit : ", time_limit)
     solution = cbsttu_planner.find_solution(soc=False, time_lim=time_limit, use_cat=True, use_pc=True,
                                           use_bp=True)
-
+    print_solution(solution)
     data.append([name_instance, "CBSTU_TDU_PC", solution.is_solved, solution.cost[1],
                  solution.time_to_solve, solution.iteration])
 
     print("////////// CBSTU_TDU //////////")
     solution = cbsttu_planner.find_solution(soc=False, time_lim=time_limit, use_cat=True, use_pc=False,
                                               use_bp=True)
-
+    print_solution(solution)
     data.append([name_instance, "CBSTU_TDU", solution.is_solved, solution.cost[1],
                  solution.time_to_solve, solution.iteration])
 
@@ -70,7 +73,7 @@ def run_exp(test_map, max_agent, time_uncertainty, task_uncertainty, time_limit,
     if solution_cbstu_pc.is_solved:
         start = time.time()
         tpg = build_tpg_from_solution(solution_cbstu_pc)
-        stnu = tpg_to_stnu(tpg, test_map.edges_and_weights, subgoal_action_time=test_map.subgoal_action_time)
+        stnu = tpg_to_stnu(tpg, test_map.edges_and_weights, subgoal_action_time=test_map.subgoal_action_time, agent_subgoals=agent_subgoals)
         stnu.check_Strong_Controllability()
         duration = time.time() - start
         time_cbstu +=  duration
@@ -91,7 +94,7 @@ def run_exp(test_map, max_agent, time_uncertainty, task_uncertainty, time_limit,
     if solution_cbstu.is_solved:
         start = time.time()
         tpg = build_tpg_from_solution(solution_cbstu)
-        stnu = tpg_to_stnu(tpg, test_map.edges_and_weights, subgoal_action_time=test_map.subgoal_action_time)
+        stnu = tpg_to_stnu(tpg, test_map.edges_and_weights, subgoal_action_time=test_map.subgoal_action_time, agent_subgoals=agent_subgoals)
         stnu.check_Strong_Controllability()
         duration = time.time() - start
         time_cbstu += duration
