@@ -35,15 +35,162 @@ import math
 import time
 import copy
 
-from pathfinding.planners.constraint_A_star_list_task import ConstraintAstar as Cas
-from pathfinding.planners.utils.constraint_node import ConstraintNode as Cn, ConstraintNode
+from pathfinding.planners.constraint_A_star_list_task_wait_before_task_start import ConstraintAstar as Cas
+from pathfinding.planners.utils.constraint_node import ConstraintNode as BaseConstraintNode
 from pathfinding.planners.utils.time_error import OutOfTimeError
-from pathfinding.planners.utils.time_uncertainty_solution import TimeUncertaintySolution
+from pathfinding.planners.utils.time_uncertainty_solution import (
+    TimeUncertaintySolution as BaseTimeUncertaintySolution,
+)
 from pathfinding.planners.utils.custom_heap import OpenListHeap
 from collections import defaultdict
 
 STAY_STILL_COST = 1
 
+
+class TimeUncertaintySolutionFix(BaseTimeUncertaintySolution):
+    """Compatibility solution that preserves ready-to-leave intervals.
+
+    Legacy plans store only vertex potential-presence intervals.  The fixed
+    low-level planner additionally attaches ``plan.ready_times``.  Edge
+    traversal intervals must start from those ready times, not from the lower
+    bound of a task vertex's broader occupancy interval.
+    """
+
+    @classmethod
+    def empty_solution(cls, iteration=0, nodes_generated=-1):
+        empty_sol = cls()
+        empty_sol.nodes_generated = nodes_generated
+        empty_sol.iteration = iteration
+        return empty_sol
+
+    @classmethod
+    def void_solution(cls, time_to_solve):
+        empty_sol = cls()
+        empty_sol.time_to_solve = time_to_solve
+        return empty_sol
+
+    def create_movement_tuples(self, agents=None):
+        """Create only real traversal-edge tuples.
+
+        Wait and task transitions remain represented by vertex occupancy in
+        ``plan.path`` and are intentionally skipped here.  For a real move,
+        the earliest edge-entry time comes from the source state's
+        ``ready_times`` entry, while the latest edge-exit time comes from the
+        destination ready/arrival interval.
+        """
+        agents = self.paths.keys() if not agents else agents
+
+        for agent in agents:
+            plan = self.paths[agent]
+            path = plan.path
+            ready_times = getattr(plan, "ready_times", None)
+            has_ready_times = ready_times is not None and len(ready_times) == len(path)
+
+            new_path = []
+            for i in range(len(path) - 1):
+                source_vertex = path[i][1]
+                target_vertex = path[i + 1][1]
+
+                # A same-location transition is a wait or an explicit task.
+                # Its collision semantics are already captured by the vertex
+                # presence intervals; it is not a navigation-edge traversal.
+                if source_vertex == target_vertex:
+                    continue
+
+                edge = (min(source_vertex, target_vertex), max(source_vertex, target_vertex))
+                direction = "f" if edge[0] == source_vertex else "b"
+
+                if has_ready_times:
+                    start_time = ready_times[i][0]
+                    finish_time = ready_times[i + 1][1]
+                else:
+                    # Backward-compatible fallback for plans produced by an
+                    # older low-level planner.
+                    start_time = path[i][0][0]
+                    finish_time = path[i + 1][0][1]
+
+                new_path.append(((start_time, finish_time), edge, direction))
+
+            self.tuple_solution[agent] = new_path
+
+    def add_stationary_moves(self, agents_to_update=None):
+        """Legacy goal-padding plus aligned ``ready_times`` metadata."""
+        max_min_time = self.get_max_of_min_path_time()
+        new_moves = set()
+
+        if agents_to_update is None:
+            agents_to_update = self.paths
+
+        # The historical method expects a mapping agent -> plan.
+        if not hasattr(agents_to_update, "items"):
+            agents_to_update = {a: self.paths[a] for a in agents_to_update}
+
+        for agent, plan in agents_to_update.items():
+            if not plan.path:
+                continue
+
+            last_move = plan.path[-1]
+            path_min_time = last_move[0][0]
+
+            if path_min_time < max_min_time:
+                padded_interval = (path_min_time + 1, max_min_time)
+                plan.path.append((padded_interval, last_move[1]))
+                new_moves.add((agent, padded_interval, last_move[1]))
+
+                ready_times = getattr(plan, "ready_times", None)
+                if ready_times is not None:
+                    ready_times.append(padded_interval)
+
+                state_path = getattr(plan, "state_path", None)
+                if state_path is not None:
+                    state_path.append(
+                        {
+                            "position": last_move[1],
+                            "presence_time": padded_interval,
+                            "g_val": padded_interval,
+                            "goal_index": state_path[-1]["goal_index"] if state_path else None,
+                            "pending_task": False,
+                            "incoming_action": "goal_wait",
+                        }
+                    )
+
+        return new_moves
+
+
+class ConstraintNodeFix(BaseConstraintNode):
+    """ConstraintNode that keeps ``TimeUncertaintySolutionFix`` instances."""
+
+    def __init__(self, new_constraints=None, parent=None):
+        # BaseConstraintNode.__init__ calls self.copy_solution(parent), so the
+        # override below is already used for non-root nodes.
+        super().__init__(new_constraints=new_constraints, parent=parent)
+        if parent is None:
+            self.sol = TimeUncertaintySolutionFix()
+
+    def copy_solution(self, parent):
+        self.sol = TimeUncertaintySolutionFix()
+        self.sol.copy_solution(parent.sol)
+
+    def update_solution(self, new_plan, use_cat=True, soc=True):
+        # The base implementation replaces self.sol with the legacy solution
+        # class in the no-path branch, so handle that branch here.
+        if not new_plan.path:
+            nodes_generated = getattr(self.sol, "nodes_generated", -1)
+            iteration = getattr(self.sol, "iteration", 0)
+            self.sol = TimeUncertaintySolutionFix.empty_solution(
+                iteration=iteration,
+                nodes_generated=nodes_generated,
+            )
+            self.sol.paths[new_plan.agent] = new_plan
+            return
+
+        super().update_solution(new_plan, use_cat=use_cat, soc=soc)
+
+
+# Keep the names used throughout the historical CBS implementation.
+Cn = ConstraintNodeFix
+ConstraintNode = ConstraintNodeFix
+TimeUncertaintySolution = TimeUncertaintySolutionFix
 
 class CBSTTU_Planner:
     """
@@ -279,7 +426,7 @@ class CBSTTU_Planner:
         given vertex. This function creates the proper tuple of constraints.
 
         Interval example:     ______________
-                        _____|_\_\_\_\_|<---- The time we want to isolate - Maximal time of overlap.
+                        _____|_X_X_X_X|<---- The time we want to isolate - Maximal time of overlap.
 
             Constraints will be of the form (agent, conflict_node, time)
         """

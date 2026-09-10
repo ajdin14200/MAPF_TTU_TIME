@@ -1,42 +1,18 @@
-"""Constraint A* for CBS_TTU with explicit uncertain task actions.
-
-This version combines the useful parts of the two historical implementations in
-``constraint_A_star_list_task.py``:
-
-* the task is an explicit low-level action, represented by
-  ``pending_goal_action``;
-* ``g_val`` (ready-to-act / ready-to-leave interval) is kept distinct from
-  ``presence_time`` (the interval during which the current vertex may be
-  occupied).
-
-The distinction is important at an intermediate goal.  If an agent arrives in
-``[a-, a+]`` and executes a task of duration ``[p-, p+]``, then the state after
-that task has
-
-    presence_time = [a-, a+ + p+]
-    g_val         = [a- + p-, a+ + p+]
-
-so vertex conflicts see the whole task occupancy while subsequent traversal
-starts no earlier than task completion.
-
-The generated ``TimeUncertaintyPlan`` keeps the legacy ``path`` format
-``[(presence_interval, vertex), ...]`` for compatibility and additionally gets
-an aligned ``ready_times`` attribute containing the ``g_val`` of each state.
-``cbs_ttu_fix.py`` uses this metadata when creating edge-movement intervals.
-"""
-
+'''
 from pathfinding.planners.utils.custom_heap import OpenListHeap
 from pathfinding.planners.utils.time_uncertainty_plan import TimeUncertaintyPlan
+from pathfinding.planners.utils.time_error import OutOfTimeError
 
+import math
 import networkx
 import time
-
 
 VERTEX_ID = 0
 STAY_STILL_COST = 1
 
 
 class ConstraintAstar:
+
     def __init__(self, tu_problem):
         self.tu_problem = tu_problem
         self.open_list = OpenListHeap()
@@ -44,25 +20,15 @@ class ConstraintAstar:
         self.closed_list = set()
         self.agent = -1
 
-        # Debug counters retained from the previous task-aware implementation.
+        # Debug counters
         self.expanded_nodes = 0
         self.generated_nodes = 0
         self.pending_action_expansions = 0
 
-    def compute_agent_path(
-        self,
-        constraints,
-        agent,
-        start_pos,
-        goals,
-        conf_table,
-        subgoal_action_time=None,
-        mbc=True,
-        time_limit=5,
-        curr_time=(0, 0),
-        pos_cons=None,
-        suboptimal=False,
-    ):
+    def compute_agent_path(self, constraints, agent, start_pos, goals, conf_table,
+                           subgoal_action_time=None, mbc=True, time_limit=5,
+                           curr_time=(0, 0), pos_cons=None, suboptimal=False):
+
         self.open_list = OpenListHeap()
         self.open_dict = {}
         self.closed_list = set()
@@ -83,28 +49,22 @@ class ConstraintAstar:
         start_goal_index = 0
         start_pending_action = False
 
-        # If the start itself is the first intermediate goal, do not execute
-        # the task implicitly.  The initial node is task-pending, so the task
-        # goes through the normal legality/constraint checks below.
-        if goals and start_pos == goals[0]:
+        if len(goals) > 0 and start_pos == goals[0]:
             if len(goals) > 1:
-                self._task_duration(goals[0], subgoal_action_time)
                 start_pending_action = True
             else:
                 start_goal_index = 1
 
         start_node = SingleAgentNode(
-            current_position=start_pos,
-            prev_node=None,
-            g=curr_time,
-            presence_time=curr_time,
-            grid_map=self.tu_problem,
-            goals=goals,
+            start_pos,
+            None,
+            curr_time,
+            self.tu_problem,
+            goals,
             confs_created=0,
             goal_index=start_goal_index,
             pending_goal_action=start_pending_action,
-            subgoal_action_time=subgoal_action_time,
-            incoming_action="start",
+            subgoal_action_time=subgoal_action_time
         )
 
         self.__add_node_to_open(start_node, mbc)
@@ -115,78 +75,588 @@ class ConstraintAstar:
 
             best_node = self.open_list.pop()
 
-            # A better CAT tie-break path to the same temporal state may have
-            # replaced an older heap entry.  Ignore such stale entries.
-            if self.open_dict.get(best_node.state_key()) is not best_node:
-                continue
-
             self.expanded_nodes += 1
-
             if best_node.pending_goal_action:
                 self.pending_action_expansions += 1
 
-            if (
-                best_node.goal_index == len(goals)
-                and not best_node.pending_goal_action
-                and self.__can_stay(agent, best_node, constraints, suboptimal)
-            ):
+            if best_node.goal_index == len(goals) and \
+                    self.__can_stay(agent, best_node, constraints, suboptimal):
                 return best_node.calc_path(agent)
 
             successors = best_node.expand(
-                agent,
-                constraints,
-                conf_table,
-                self.tu_problem,
-                pos_cons,
-                suboptimal,
+                agent, constraints, conf_table, self.tu_problem, pos_cons, suboptimal
             )
 
             self.__remove_node_from_open(best_node)
 
-            for successor in successors:
+            for neighbor in successors:
                 self.generated_nodes += 1
-                state_key = successor.state_key()
 
-                if state_key in self.closed_list:
+                if neighbor in self.closed_list:
                     continue
 
-                current_open = self.open_dict.get(state_key)
-                if current_open is None:
-                    successor.prev_node = best_node
-                    self.__add_node_to_open(successor, mbc)
-                    continue
+                g_val = neighbor[1]
 
-                # The temporal state is identical.  Keep the version that has
-                # created fewer CAT conflicts; push it as a fresh heap entry
-                # and let the stale-entry check above discard the old one.
-                if successor.confs_created >= current_open.confs_created:
-                    continue
+                if neighbor not in self.open_dict:
+                    neighbor_node = SingleAgentNode(
+                        neighbor[0],
+                        best_node,
+                        neighbor[1],
+                        self.tu_problem,
+                        goals,
+                        neighbor[2],
+                        goal_index=neighbor[3],
+                        pending_goal_action=neighbor[4],
+                        subgoal_action_time=subgoal_action_time
+                    )
+                    self.__add_node_to_open(neighbor_node, mbc)
+                else:
+                    neighbor_node = self.open_dict[neighbor]
 
-                successor.prev_node = best_node
-                self.__add_node_to_open(successor, mbc)
+                    if mbc and g_val[0] >= neighbor_node.g_val[0]:
+                        continue
+                    elif not mbc and g_val[1] >= neighbor_node.g_val[1]:
+                        continue
+
+                    self.__update_node(
+                        neighbor_node,
+                        best_node,
+                        g_val,
+                        goals,
+                        self.tu_problem,
+                        neighbor[3],
+                        neighbor[4],
+                        subgoal_action_time
+                    )
 
         return TimeUncertaintyPlan.get_empty_plan(agent)
 
+    def __remove_node_from_open(self, node):
+        node_tuple = node.create_tuple()
+        self.open_dict.pop(node_tuple, None)
+        self.closed_list.add(node_tuple)
+
+    def __add_node_to_open(self, node, min_best_case):
+        if min_best_case:
+            self.open_list.push(node, node.g_val[0] + node.h_val, node.confs_created, -node.g_val[0])
+        else:
+            self.open_list.push(node, node.g_val[1] + node.h_val, node.confs_created, -node.g_val[1])
+
+        key_tuple = node.create_tuple()
+        self.open_dict[key_tuple] = node
+        return node
+
     @staticmethod
-    def _task_duration(vertex, subgoal_action_time):
-        """Return a task interval and fail loudly for malformed TTU instances."""
-        if vertex not in subgoal_action_time:
-            raise ValueError(
-                f"Missing task duration for intermediate goal {vertex!r}. "
-                "Every non-final ordered goal must have a (lb, ub) task interval."
+    def __update_node(neighbor_node, prev_node, g_val, goals, grid_map,
+                      goal_index, pending_goal_action, subgoal_action_time):
+        neighbor_node.prev_node = prev_node
+        neighbor_node.g_val = g_val
+        neighbor_node.goal_index = goal_index
+        neighbor_node.pending_goal_action = pending_goal_action
+        neighbor_node.subgoal_action_time = subgoal_action_time
+
+        neighbor_node.h_val = neighbor_node.calc_sequence_heuristic(
+            grid_map,
+            neighbor_node.current_position,
+            goals,
+            goal_index,
+            pending_goal_action,
+            subgoal_action_time
+        )
+
+        neighbor_node.f_val = (
+            g_val[0] + neighbor_node.h_val,
+            g_val[1] + neighbor_node.h_val
+        )
+
+    def __can_stay(self, agent, best_node, constraints, suboptimal):
+        if suboptimal:
+            if best_node.current_position in constraints:
+                for tick in sorted(constraints[best_node.current_position], key=lambda k: k[1]):
+                    if best_node.g_val[0] <= tick[1]:
+                        self.__create_wait_node(best_node, tick[1])
+                        self.open_dict = {}
+                        self.open_list = OpenListHeap()
+                        return False
+            return True
+
+        if best_node.current_position in constraints:
+            for con in constraints[best_node.current_position]:
+                if con[0] == agent and best_node.g_val[0] <= con[1][1]:
+                    return False
+
+        return True
+
+    def dijkstra_solution(self, source_vertex, min_best_case=False):
+        graph = networkx.Graph()
+
+        for vertex, edges in self.tu_problem.edges_and_weights.items():
+            for edge in edges:
+                if min_best_case:
+                    graph.add_edge(vertex, edge[0], weight=edge[1][0])
+                else:
+                    graph.add_edge(vertex, edge[0], weight=edge[1][1])
+
+        try:
+            return networkx.single_source_dijkstra_path_length(graph, source_vertex)
+        except ValueError:
+            print("neg value wut")
+
+    @staticmethod
+    def overlapping(time_1, time_2):
+        return (time_1[0] <= time_2[0] <= time_1[1]) or \
+               (time_2[0] <= time_1[0] <= time_2[1])
+
+    def __create_wait_node(self, best_node, con_time):
+        curr_pos = best_node.current_position
+
+        temp_best = SingleAgentNode(
+            curr_pos,
+            best_node.prev_node,
+            best_node.g_val,
+            self.tu_problem,
+            best_node.goals,
+            best_node.confs_created,
+            goal_index=best_node.goal_index,
+            pending_goal_action=best_node.pending_goal_action,
+            subgoal_action_time=best_node.subgoal_action_time
+        )
+
+        delta = best_node.g_val[1] - best_node.g_val[0]
+        g_val = (best_node.g_val[0] + 1, best_node.g_val[0] + 1 + delta)
+
+        prev_node = SingleAgentNode(
+            curr_pos,
+            temp_best,
+            g_val,
+            self.tu_problem,
+            best_node.goals,
+            best_node.confs_created,
+            goal_index=best_node.goal_index,
+            pending_goal_action=best_node.pending_goal_action,
+            subgoal_action_time=best_node.subgoal_action_time
+        )
+
+        for g in range(prev_node.g_val[0] + 1, con_time - 1):
+            g_val = (g, g + delta)
+            curr_node = SingleAgentNode(
+                curr_pos,
+                prev_node,
+                g_val,
+                self.tu_problem,
+                best_node.goals,
+                best_node.confs_created,
+                goal_index=best_node.goal_index,
+                pending_goal_action=best_node.pending_goal_action,
+                subgoal_action_time=best_node.subgoal_action_time
+            )
+            prev_node = curr_node
+
+        best_node.prev_node = prev_node
+        best_node.g_val = (g_val[0] + 1, g_val[1] + 1)
+
+
+class SingleAgentNode:
+
+    def __init__(self, current_position, prev_node, g, grid_map, goals,
+                 confs_created, goal_index=0, pending_goal_action=False,
+                 subgoal_action_time=None):
+
+        self.current_position = current_position
+        self.prev_node = prev_node
+        self.g_val = g
+        self.confs_created = confs_created
+
+        self.goals = goals
+        self.goal_index = goal_index
+        self.pending_goal_action = pending_goal_action
+        self.subgoal_action_time = subgoal_action_time or {}
+
+        self.h_val = self.calc_sequence_heuristic(
+            grid_map,
+            current_position,
+            goals,
+            goal_index,
+            pending_goal_action,
+            self.subgoal_action_time
+        )
+
+        self.f_val = (
+            self.g_val[0] + self.h_val,
+            self.g_val[1] + self.h_val
+        )
+
+    @staticmethod
+    def calc_sequence_heuristic(grid_map, current_position, goals, goal_index,
+                                pending_goal_action=False, subgoal_action_time=None):
+        """
+        Admissible heuristic for ordered goals with task durations.
+
+        It includes:
+        - distance from current position to next goal
+        - distances between remaining goals
+        - minimum task duration for each remaining non-final subgoal
+        """
+
+        if goal_index >= len(goals):
+            return 0
+
+        if subgoal_action_time is None:
+            subgoal_action_time = {}
+
+        h = grid_map.calc_heuristic(current_position, goals[goal_index])
+
+        for i in range(goal_index, len(goals) - 1):
+            subgoal = goals[i]
+
+            if subgoal in subgoal_action_time:
+                h += subgoal_action_time[subgoal][0]
+
+            h += grid_map.calc_heuristic(goals[i], goals[i + 1])
+
+        return h
+
+    def create_tuple(self):
+        return (
+            self.current_position,
+            self.g_val,
+            self.confs_created,
+            self.goal_index,
+            self.pending_goal_action
+        )
+
+    def calc_path(self, agent):
+        path = []
+        curr_node = self
+
+        while curr_node:
+            move = (curr_node.g_val, curr_node.current_position)
+            path.insert(0, move)
+            curr_node = curr_node.prev_node
+
+        return TimeUncertaintyPlan(agent, path, self.g_val)
+
+    def _count_conflicts_for_successor(self, agent, conflict_table, succ_time, edge):
+        if len(conflict_table) == 0:
+            return 0
+        return self.confs_created + self.count_conflicts(agent, conflict_table, succ_time, edge)
+
+    def expand(self, agent, constraints, conflict_table, search_map, pos_cons, suboptimal):
+        neighbors = []
+
+        # ------------------------------------------------------------
+        # Case 1: pending subgoal action
+        # ------------------------------------------------------------
+        if self.pending_goal_action:
+            goal_vertex = self.goals[self.goal_index]
+
+            assert self.current_position == goal_vertex, \
+                "Pending subgoal action but not on the subgoal vertex"
+
+            # Do NOT mutate self.subgoal_action_time here.
+            action_duration = self.subgoal_action_time.get(goal_vertex, (1, 1))
+
+            action_time = (
+                self.g_val[0] + action_duration[0],
+                self.g_val[1] + action_duration[1]
             )
 
-        lb, ub = subgoal_action_time[vertex]
-        if lb < 0 or ub < lb:
-            raise ValueError(
-                f"Invalid task duration for {vertex!r}: {(lb, ub)!r}"
+            if self.legal_move(agent, self.current_position, action_time, constraints, pos_cons, suboptimal):
+                confs_created = self._count_conflicts_for_successor(
+                    agent,
+                    conflict_table,
+                    action_time,
+                    (self.current_position, self.current_position)
+                )
+
+                successor = (
+                    self.current_position,
+                    action_time,
+                    confs_created,
+                    self.goal_index + 1,
+                    False
+                )
+                neighbors.append(successor)
+
+            return neighbors
+
+        # ------------------------------------------------------------
+        # Case 2: normal one-tick wait
+        # ------------------------------------------------------------
+        still_time = (
+            self.g_val[0] + STAY_STILL_COST,
+            self.g_val[1] + STAY_STILL_COST
+        )
+
+        if self.legal_move(agent, self.current_position, still_time, constraints, pos_cons, suboptimal):
+            confs_created = self._count_conflicts_for_successor(
+                agent,
+                conflict_table,
+                (still_time[1], still_time[1]),
+                (self.current_position, self.current_position)
             )
-        return lb, ub
+
+            next_goal_index = self.goal_index
+            next_pending_action = False
+
+            if next_goal_index < len(self.goals) and self.current_position == self.goals[next_goal_index]:
+                if next_goal_index < len(self.goals) - 1:
+                    next_pending_action = True
+                else:
+                    next_goal_index += 1
+
+            stay_still = (
+                self.current_position,
+                still_time,
+                confs_created,
+                next_goal_index,
+                next_pending_action
+            )
+            neighbors.append(stay_still)
+
+        # ------------------------------------------------------------
+        # Case 3: normal moves
+        # ------------------------------------------------------------
+        for edge_tuple in search_map.edges_and_weights[self.current_position]:
+            successor_time = (
+                self.g_val[0] + edge_tuple[1][0],
+                self.g_val[1] + edge_tuple[1][1]
+            )
+
+            vertex = edge_tuple[VERTEX_ID]
+
+            if self.legal_move(agent, vertex, successor_time, constraints, pos_cons, suboptimal):
+                next_goal_index = self.goal_index
+                next_pending_action = False
+
+                if next_goal_index < len(self.goals) and vertex == self.goals[next_goal_index]:
+                    if next_goal_index < len(self.goals) - 1:
+                        next_pending_action = True
+                    else:
+                        next_goal_index += 1
+
+                confs_created = self._count_conflicts_for_successor(
+                    agent,
+                    conflict_table,
+                    successor_time,
+                    (self.current_position, vertex)
+                )
+
+                successor = (
+                    vertex,
+                    successor_time,
+                    confs_created,
+                    next_goal_index,
+                    next_pending_action
+                )
+                neighbors.append(successor)
+
+        return neighbors
+
+    @staticmethod
+    def count_conflicts(agent, conflict_table, succ_time, edge):
+        new_confs = 0
+
+        for other, locations in conflict_table.items():
+            if other == agent:
+                continue
+
+            if edge[1] in locations:
+                for pres in locations[edge[1]]:
+                    if (pres[0] <= succ_time[0] <= pres[1]) or \
+                       (succ_time[0] <= pres[0] <= succ_time[1]):
+                        new_confs += min(succ_time[1], pres[1]) - max(succ_time[0], pres[0]) + 1
+
+            if edge in locations:
+                for pres in locations[edge]:
+                    if (pres[0][0] <= succ_time[0] <= pres[0][1]) or \
+                       (succ_time[0] <= pres[0][0] <= succ_time[1]):
+                        new_confs += min(succ_time[1], pres[0][1]) - max(succ_time[0], pres[0][0]) + 1
+
+        return new_confs
+
+    def legal_move(self, agent, vertex, succ_time, constraints, pos_cons, suboptimal):
+        edge = min(self.current_position, vertex), max(self.current_position, vertex)
+        edge_time = self.calc_edge_time(succ_time)
+
+        if suboptimal:
+            if edge in constraints:
+                for tick in constraints[edge]:
+                    if (tick[0] <= edge_time[0] <= tick[1]) or \
+                       (edge_time[0] <= tick[0] <= edge_time[1]):
+                        return False
+
+            if vertex in constraints:
+                for tick in constraints[vertex]:
+                    if (tick[0] <= succ_time[0] <= tick[1]) or \
+                       (succ_time[0] <= tick[0] <= succ_time[1]):
+                        return False
+
+            return True
+
+        if pos_cons:
+            for tick in range(succ_time[0], succ_time[1] + 1):
+                if (agent, vertex, tick) not in pos_cons:
+                    return False
+
+        if edge in constraints:
+            for con in constraints[edge]:
+                if con[0] == agent and (
+                    (con[1][0] <= edge_time[0] <= con[1][1]) or
+                    (edge_time[0] <= con[1][1] <= edge_time[1])
+                ):
+                    return False
+
+        if vertex in constraints:
+            for con in constraints[vertex]:
+                if con[0] == agent and (
+                    (con[1][0] <= succ_time[0] <= con[1][1]) or
+                    (succ_time[0] <= con[1][1] <= succ_time[1])
+                ):
+                    return False
+
+        return True
+
+    def calc_edge_time(self, succ_time):
+        if (succ_time[0] - self.g_val[0], succ_time[1] - self.g_val[1]) == (1, 1):
+            return self.g_val[0], succ_time[1]
+        return self.g_val[0], succ_time[1]
+'''
+
+
+from pathfinding.planners.utils.custom_heap import OpenListHeap
+from pathfinding.planners.utils.time_uncertainty_plan import TimeUncertaintyPlan
+import networkx
+import time
+
+VERTEX_ID = 0
+STAY_STILL_COST = 1
+
+
+class ConstraintAstar:
+
+    def __init__(self, tu_problem):
+        self.tu_problem = tu_problem
+        self.open_list = OpenListHeap()
+        self.open_dict = {}
+        self.closed_list = set()
+        self.agent = -1
+
+        self.expanded_nodes = 0
+        self.generated_nodes = 0
+
+    def compute_agent_path(self, constraints, agent, start_pos, goals, conf_table,
+                           subgoal_action_time=None, mbc=True, time_limit=5,
+                           curr_time=(0, 0), pos_cons=None, suboptimal=False):
+
+        self.open_list = OpenListHeap()
+        self.open_dict = {}
+        self.closed_list = set()
+        self.agent = agent
+
+        self.expanded_nodes = 0
+        self.generated_nodes = 0
+
+        if subgoal_action_time is None:
+            subgoal_action_time = {}
+
+        if not isinstance(goals, list):
+            goals = [goals]
+
+        start_time = time.time()
+
+        start_goal_index = 0
+        start_g_val = curr_time
+        start_presence_time = curr_time
+
+        # If the agent starts on an initial subgoal, execute the task implicitly.
+        if len(goals) > 0 and start_pos == goals[0]:
+            if len(goals) > 1:
+                task_lb, task_ub = subgoal_action_time.get(start_pos, (1, 1))
+                start_presence_time = (curr_time[0], curr_time[1] + task_ub)
+                start_g_val = (curr_time[0] + task_lb, curr_time[1] + task_ub)
+                start_goal_index = 1
+            else:
+                start_goal_index = 1
+
+        start_node = SingleAgentNode(
+            current_position=start_pos,
+            prev_node=None,
+            g=start_g_val,
+            presence_time=start_presence_time,
+            grid_map=self.tu_problem,
+            goals=goals,
+            confs_created=0,
+            goal_index=start_goal_index,
+            subgoal_action_time=subgoal_action_time
+        )
+
+        self.__add_node_to_open(start_node, mbc)
+
+        while len(self.open_list.internal_heap) > 0:
+            if time.time() - start_time > time_limit:
+                return TimeUncertaintyPlan.get_empty_plan(agent)
+
+            best_node = self.open_list.pop()
+            self.expanded_nodes += 1
+
+            if best_node.goal_index == len(goals) and \
+                    self.__can_stay(agent, best_node, constraints, suboptimal):
+                return best_node.calc_path(agent)
+
+            successors = best_node.expand(
+                agent, constraints, conf_table, self.tu_problem, pos_cons, suboptimal
+            )
+
+            self.__remove_node_from_open(best_node)
+
+            for neighbor in successors:
+                self.generated_nodes += 1
+
+                if neighbor in self.closed_list:
+                    continue
+
+                g_val = neighbor[1]
+
+                if neighbor not in self.open_dict:
+                    neighbor_node = SingleAgentNode(
+                        current_position=neighbor[0],
+                        prev_node=best_node,
+                        g=neighbor[1],
+                        presence_time=neighbor[2],
+                        grid_map=self.tu_problem,
+                        goals=goals,
+                        confs_created=neighbor[3],
+                        goal_index=neighbor[4],
+                        subgoal_action_time=subgoal_action_time
+                    )
+                    self.__add_node_to_open(neighbor_node, mbc)
+
+                else:
+                    neighbor_node = self.open_dict[neighbor]
+
+                    if mbc and g_val[0] >= neighbor_node.g_val[0]:
+                        continue
+                    elif not mbc and g_val[1] >= neighbor_node.g_val[1]:
+                        continue
+
+                    self.__update_node(
+                        neighbor_node,
+                        best_node,
+                        neighbor[1],
+                        neighbor[2],
+                        goals,
+                        self.tu_problem,
+                        neighbor[4],
+                        subgoal_action_time
+                    )
+
+        return TimeUncertaintyPlan.get_empty_plan(agent)
 
     def __remove_node_from_open(self, node):
-        key = node.state_key()
-        self.open_dict.pop(key, None)
-        self.closed_list.add(key)
+        node_tuple = node.create_tuple()
+        self.open_dict.pop(node_tuple, None)
+        self.closed_list.add(node_tuple)
 
     def __add_node_to_open(self, node, min_best_case):
         if min_best_case:
@@ -194,32 +664,46 @@ class ConstraintAstar:
                 node,
                 node.g_val[0] + node.h_val,
                 node.confs_created,
-                -node.g_val[0],
+                -node.g_val[0]
             )
         else:
             self.open_list.push(
                 node,
                 node.g_val[1] + node.h_val,
                 node.confs_created,
-                -node.g_val[1],
+                -node.g_val[1]
             )
 
-        self.open_dict[node.state_key()] = node
+        self.open_dict[node.create_tuple()] = node
         return node
 
-    def __can_stay(self, agent, best_node, constraints, suboptimal):
-        """Check that the agent may remain forever at its final vertex.
+    @staticmethod
+    def __update_node(neighbor_node, prev_node, g_val, presence_time,
+                      goals, grid_map, goal_index, subgoal_action_time):
 
-        This keeps the original CBS_TU semantics.  If a future constraint exists
-        at the goal, A* continues expanding wait actions instead of accepting the
-        node as a terminal solution.
-        """
+        neighbor_node.prev_node = prev_node
+        neighbor_node.g_val = g_val
+        neighbor_node.presence_time = presence_time
+        neighbor_node.goal_index = goal_index
+        neighbor_node.subgoal_action_time = subgoal_action_time
+
+        neighbor_node.h_val = neighbor_node.calc_sequence_heuristic(
+            grid_map,
+            neighbor_node.current_position,
+            goals,
+            goal_index,
+            subgoal_action_time
+        )
+
+        neighbor_node.f_val = (
+            g_val[0] + neighbor_node.h_val,
+            g_val[1] + neighbor_node.h_val
+        )
+
+    def __can_stay(self, agent, best_node, constraints, suboptimal):
         if suboptimal:
             if best_node.current_position in constraints:
-                for tick in sorted(
-                    constraints[best_node.current_position], key=lambda k: k[1]
-                ):
-                    # Suboptimal constraints do not carry an agent id.
+                for tick in sorted(constraints[best_node.current_position], key=lambda k: k[1]):
                     if best_node.g_val[0] <= tick[1]:
                         return False
             return True
@@ -236,75 +720,50 @@ class ConstraintAstar:
 
         for vertex, edges in self.tu_problem.edges_and_weights.items():
             for edge in edges:
-                weight = edge[1][0] if min_best_case else edge[1][1]
-                graph.add_edge(vertex, edge[0], weight=weight)
+                if min_best_case:
+                    graph.add_edge(vertex, edge[0], weight=edge[1][0])
+                else:
+                    graph.add_edge(vertex, edge[0], weight=edge[1][1])
 
         return networkx.single_source_dijkstra_path_length(graph, source_vertex)
 
-    @staticmethod
-    def overlapping(time_1, time_2):
-        return (time_1[0] <= time_2[0] <= time_1[1]) or (
-            time_2[0] <= time_1[0] <= time_2[1]
-        )
-
 
 class SingleAgentNode:
-    def __init__(
-        self,
-        current_position,
-        prev_node,
-        g,
-        presence_time,
-        grid_map,
-        goals,
-        confs_created,
-        goal_index=0,
-        pending_goal_action=False,
-        subgoal_action_time=None,
-        incoming_action=None,
-    ):
+
+    def __init__(self, current_position, prev_node, g, presence_time,
+                 grid_map, goals, confs_created, goal_index=0,
+                 subgoal_action_time=None):
+
         self.current_position = current_position
         self.prev_node = prev_node
 
-        # Earliest/latest time at which the agent is ready to execute its next
-        # action (or leave this vertex).
+        # ready-to-leave interval
         self.g_val = g
 
-        # Potential occupancy of the current vertex represented by this state.
-        # In a task-completion state this covers the whole task execution.
+        # interval during which this vertex may be occupied
         self.presence_time = presence_time
 
         self.confs_created = confs_created
         self.goals = goals
         self.goal_index = goal_index
-        self.pending_goal_action = pending_goal_action
         self.subgoal_action_time = subgoal_action_time or {}
-        self.incoming_action = incoming_action
 
         self.h_val = self.calc_sequence_heuristic(
             grid_map,
             current_position,
             goals,
             goal_index,
-            pending_goal_action,
-            self.subgoal_action_time,
+            self.subgoal_action_time
         )
 
         self.f_val = (
             self.g_val[0] + self.h_val,
-            self.g_val[1] + self.h_val,
+            self.g_val[1] + self.h_val
         )
 
     @staticmethod
-    def calc_sequence_heuristic(
-        grid_map,
-        current_position,
-        goals,
-        goal_index,
-        pending_goal_action=False,
-        subgoal_action_time=None,
-    ):
-        """Admissible ordered-goal heuristic including task lower bounds."""
+    def calc_sequence_heuristic(grid_map, current_position, goals,
+                                goal_index, subgoal_action_time=None):
         if goal_index >= len(goals):
             return 0
 
@@ -315,164 +774,130 @@ class SingleAgentNode:
 
         for i in range(goal_index, len(goals) - 1):
             subgoal = goals[i]
+
             if subgoal in subgoal_action_time:
                 h += subgoal_action_time[subgoal][0]
+
             h += grid_map.calc_heuristic(goals[i], goals[i + 1])
 
         return h
 
-    def state_key(self):
-        """Search-state identity requested by the explicit-task formulation.
-
-        ``presence_time`` is included because two nodes may be equally ready to
-        leave while representing different conservative occupancy intervals.
-        CAT conflict counts are deliberately not part of the state identity;
-        they are only a tie-breaker.
-        """
+    def create_tuple(self):
         return (
             self.current_position,
             self.g_val,
             self.presence_time,
-            self.goal_index,
-            self.pending_goal_action,
+            self.confs_created,
+            self.goal_index
         )
-
-    # Backward-compatible name used by older surrounding code/debug tools.
-    def create_tuple(self):
-        return self.state_key()
 
     def calc_path(self, agent):
         path = []
-        ready_times = []
-        state_path = []
-
         curr_node = self
+
         while curr_node:
-            path.insert(0, (curr_node.presence_time, curr_node.current_position))
-            ready_times.insert(0, curr_node.g_val)
-            state_path.insert(
-                0,
-                {
-                    "position": curr_node.current_position,
-                    "presence_time": curr_node.presence_time,
-                    "g_val": curr_node.g_val,
-                    "goal_index": curr_node.goal_index,
-                    "pending_task": curr_node.pending_goal_action,
-                    "incoming_action": curr_node.incoming_action,
-                },
-            )
+            move = (curr_node.presence_time, curr_node.current_position)
+            path.insert(0, move)
             curr_node = curr_node.prev_node
 
-        plan = TimeUncertaintyPlan(agent, path, self.g_val)
-        # Extra metadata is intentionally additive so existing code that only
-        # consumes ``plan.path`` keeps working.
-        plan.ready_times = ready_times
-        plan.state_path = state_path
-        return plan
+        return TimeUncertaintyPlan(agent, path, self.g_val)
 
-    def _count_conflicts_for_successor(
-        self, agent, conflict_table, vertex_time, edge, edge_time=None
-    ):
+    def _count_conflicts_for_successor(self, agent, conflict_table, vertex_time, edge):
         if len(conflict_table) == 0:
-            return self.confs_created
+            return 0
 
         return self.confs_created + self.count_conflicts(
             agent,
             conflict_table,
             vertex_time,
-            edge,
-            edge_time=edge_time,
+            edge
         )
 
-    def _wait_successor(
-        self, agent, constraints, conflict_table, search_map, pos_cons, suboptimal
-    ):
-        """One deterministic wait, preserving task-pending status."""
+    def expand(self, agent, constraints, conflict_table, search_map, pos_cons, suboptimal):
+        neighbors = []
+
+        # ------------------------------------------------------------
+        # Case 1: wait action
+        # ------------------------------------------------------------
         still_g = (
             self.g_val[0] + STAY_STILL_COST,
-            self.g_val[1] + STAY_STILL_COST,
+            self.g_val[1] + STAY_STILL_COST
         )
 
-        # The current state already covers its previous presence.  Including
-        # the whole wait interval here is conservative and makes the action's
-        # legality explicit.
-        wait_presence = still_g #(self.g_val[0], still_g[1])
+        still_presence = still_g
         edge_time = (self.g_val[0], still_g[1])
 
-        if not self.legal_move(
+        if self.legal_move(
             agent,
             self.current_position,
-            wait_presence,
+            still_presence,
             constraints,
             pos_cons,
             suboptimal,
             edge_time=edge_time
         ):
-            return None
-
-        confs_created = self._count_conflicts_for_successor(
-            agent,
-            conflict_table,
-            wait_presence,
-            (self.current_position, self.current_position),
-            edge_time=None,
-        )
-
-        return SingleAgentNode(
-            current_position=self.current_position,
-            prev_node=None,
-            g=still_g,
-            presence_time=wait_presence,
-            grid_map=search_map,
-            goals=self.goals,
-            confs_created=confs_created,
-            goal_index=self.goal_index,
-            pending_goal_action=self.pending_goal_action,
-            subgoal_action_time=self.subgoal_action_time,
-            incoming_action="wait",
-        )
-
-    def expand(
-        self, agent, constraints, conflict_table, search_map, pos_cons, suboptimal
-    ):
-        neighbors = []
-
-        # Waiting is legal both before and after task execution.  This is the
-        # key difference from the historical first implementation, where a
-        # pending task had to start immediately.
-        wait_node = self._wait_successor(
-            agent, constraints, conflict_table, search_map, pos_cons, suboptimal
-        )
-        if wait_node is not None:
-            neighbors.append(wait_node)
-
-        # ------------------------------------------------------------
-        # Explicit task action
-        # ------------------------------------------------------------
-        if self.pending_goal_action:
-            goal_vertex = self.goals[self.goal_index]
-            if self.current_position != goal_vertex:
-                raise AssertionError(
-                    "Pending subgoal action but not on the corresponding goal vertex"
-                )
-
-            task_lb, task_ub = ConstraintAstar._task_duration(
-                goal_vertex, self.subgoal_action_time
-            )
-            task_done_g = (
-                self.g_val[0] + task_lb,
-                self.g_val[1] + task_ub,
+            confs_created = self._count_conflicts_for_successor(
+                agent,
+                conflict_table,
+                still_presence,
+                (self.current_position, self.current_position)
             )
 
-            # From task start until the latest possible completion, the robot
-            # occupies the subgoal vertex.
-            task_presence = task_done_g #(self.g_val[0], task_done_g[1])
-            edge_time = (self.g_val[0], task_done_g[1])
+            neighbors.append((
+                self.current_position,
+                still_g,
+                still_presence,
+                confs_created,
+                self.goal_index
+            ))
+
+        # ------------------------------------------------------------
+        # Case 2: movement action, possibly followed by implicit task
+        # ------------------------------------------------------------
+        for edge_tuple in search_map.edges_and_weights[self.current_position]:
+            vertex = edge_tuple[VERTEX_ID]
+            edge_lb, edge_ub = edge_tuple[1]
+
+            arrival_time = (
+                self.g_val[0] + edge_lb,
+                self.g_val[1] + edge_ub
+            )
+
+            edge_time = (
+                self.g_val[0],
+                arrival_time[1]
+            )
+
+            next_goal_index = self.goal_index
+            successor_g = arrival_time
+            successor_presence = arrival_time
+
+            # If this vertex is the next required non-final goal,
+            # execute the task implicitly.
+            if next_goal_index < len(self.goals) and vertex == self.goals[next_goal_index]:
+
+                if next_goal_index < len(self.goals) - 1:
+                    task_lb, task_ub = self.subgoal_action_time.get(vertex, (1, 1))
+
+                    successor_presence = (
+                        arrival_time[0],
+                        arrival_time[1] + task_ub
+                    )
+
+                    successor_g = (
+                        arrival_time[0] + task_lb,
+                        arrival_time[1] + task_ub
+                    )
+
+                    next_goal_index += 1
+
+                else:
+                    next_goal_index += 1
 
             if self.legal_move(
                 agent,
-                self.current_position,
-                task_presence,
+                vertex,
+                successor_presence,
                 constraints,
                 pos_cons,
                 suboptimal,
@@ -481,104 +906,22 @@ class SingleAgentNode:
                 confs_created = self._count_conflicts_for_successor(
                     agent,
                     conflict_table,
-                    task_presence,
-                    (self.current_position, self.current_position),
-                    edge_time=None,
+                    successor_presence,
+                    (self.current_position, vertex)
                 )
 
-                neighbors.append(
-                    SingleAgentNode(
-                        current_position=self.current_position,
-                        prev_node=None,
-                        g=task_done_g,
-                        presence_time=task_presence,
-                        grid_map=search_map,
-                        goals=self.goals,
-                        confs_created=confs_created,
-                        goal_index=self.goal_index + 1,
-                        pending_goal_action=False,
-                        subgoal_action_time=self.subgoal_action_time,
-                        incoming_action="task",
-                    )
-                )
-
-            # While a task is pending the only choices are wait or execute it;
-            # the agent cannot leave the subgoal before task completion.
-            return neighbors
-
-        # ------------------------------------------------------------
-        # Movement actions
-        # ------------------------------------------------------------
-        for edge_tuple in search_map.edges_and_weights[self.current_position]:
-            vertex = edge_tuple[VERTEX_ID]
-            edge_lb, edge_ub = edge_tuple[1]
-
-            arrival_time = (
-                self.g_val[0] + edge_lb,
-                self.g_val[1] + edge_ub,
-            )
-            edge_time = (self.g_val[0], arrival_time[1])
-
-            next_goal_index = self.goal_index
-            next_pending_action = False
-
-            if next_goal_index < len(self.goals) and vertex == self.goals[next_goal_index]:
-                if next_goal_index < len(self.goals) - 1:
-                    ConstraintAstar._task_duration(vertex, self.subgoal_action_time)
-                    next_pending_action = True
-                else:
-                    # Final goal has no task in MAPF-TTU.
-                    next_goal_index += 1
-
-            if not self.legal_move(
-                agent,
-                vertex,
-                arrival_time,
-                constraints,
-                pos_cons,
-                suboptimal,
-                edge_time=edge_time,
-                check_edge=True,
-            ):
-                continue
-
-            confs_created = self._count_conflicts_for_successor(
-                agent,
-                conflict_table,
-                arrival_time,
-                (self.current_position, vertex),
-                edge_time=edge_time,
-            )
-
-            neighbors.append(
-                SingleAgentNode(
-                    current_position=vertex,
-                    prev_node=None,
-                    g=arrival_time,
-                    presence_time=arrival_time,
-                    grid_map=search_map,
-                    goals=self.goals,
-                    confs_created=confs_created,
-                    goal_index=next_goal_index,
-                    pending_goal_action=next_pending_action,
-                    subgoal_action_time=self.subgoal_action_time,
-                    incoming_action="move",
-                )
-            )
+                neighbors.append((
+                    vertex,
+                    successor_g,
+                    successor_presence,
+                    confs_created,
+                    next_goal_index
+                ))
 
         return neighbors
 
     @staticmethod
-    def count_conflicts(
-        agent, conflict_table, vertex_time, edge, edge_time=None
-    ):
-        """Count CAT overlaps for tie-breaking.
-
-        Vertex occupancy uses ``vertex_time``.  Real movement edges use their
-        own ``edge_time``; self-transitions (wait/task) intentionally have no
-        edge occupancy because their collision semantics are purely vertex
-        occupancy.
-        """
+    def count_conflicts(agent, conflict_table, succ_time, edge):
         new_confs = 0
 
         for other, locations in conflict_table.items():
@@ -587,84 +930,57 @@ class SingleAgentNode:
 
             if edge[1] in locations:
                 for pres in locations[edge[1]]:
-                    # CAT entries for vertices are plain intervals; edge CAT
-                    # entries are ``(interval, direction)`` and therefore not
-                    # considered in this branch.
-                    if (
-                        isinstance(pres, tuple)
-                        and len(pres) == 2
-                        and not isinstance(pres[0], tuple)
-                    ):
-                        if ConstraintAstar.overlapping(vertex_time, pres):
-                            new_confs += (
-                                min(vertex_time[1], pres[1])
-                                - max(vertex_time[0], pres[0])
-                                + 1
-                            )
+                    if (pres[0] <= succ_time[0] <= pres[1]) or \
+                       (succ_time[0] <= pres[0] <= succ_time[1]):
+                        new_confs += min(succ_time[1], pres[1]) - max(succ_time[0], pres[0]) + 1
 
-            if edge_time is not None:
-                canonical_edge = (min(edge[0], edge[1]), max(edge[0], edge[1]))
-                if canonical_edge in locations:
-                    for pres in locations[canonical_edge]:
-                        if not (
-                            isinstance(pres, tuple)
-                            and len(pres) == 2
-                            and isinstance(pres[0], tuple)
-                        ):
-                            continue
-                        other_interval = pres[0]
-                        if ConstraintAstar.overlapping(edge_time, other_interval):
-                            new_confs += (
-                                min(edge_time[1], other_interval[1])
-                                - max(edge_time[0], other_interval[0])
-                                + 1
-                            )
+            if edge in locations:
+                for pres in locations[edge]:
+                    if (pres[0][0] <= succ_time[0] <= pres[0][1]) or \
+                       (succ_time[0] <= pres[0][0] <= succ_time[1]):
+                        new_confs += min(succ_time[1], pres[0][1]) - max(succ_time[0], pres[0][0]) + 1
 
         return new_confs
 
-    def legal_move(
-        self,
-        agent,
-        vertex,
-        vertex_time,
-        constraints,
-        pos_cons,
-        suboptimal,
-        edge_time=None,
-        check_edge=True,
-    ):
-        canonical_edge = (
-            min(self.current_position, vertex),
-            max(self.current_position, vertex),
-        )
+    def legal_move(self, agent, vertex, vertex_time, constraints,
+                   pos_cons, suboptimal, edge_time=None):
+
+        edge = min(self.current_position, vertex), max(self.current_position, vertex)
+
+        if edge_time is None:
+            edge_time = (self.g_val[0], vertex_time[1])
 
         if suboptimal:
-            if check_edge and edge_time is not None and canonical_edge in constraints:
-                for tick in constraints[canonical_edge]:
-                    if ConstraintAstar.overlapping(edge_time, tick):
+            if edge in constraints:
+                for tick in constraints[edge]:
+                    if self.overlap(edge_time, tick):
                         return False
 
             if vertex in constraints:
                 for tick in constraints[vertex]:
-                    if ConstraintAstar.overlapping(vertex_time, tick):
+                    if self.overlap(vertex_time, tick):
                         return False
+
             return True
 
         if pos_cons:
-            # The original implementation assumes integer time.  Preserve that
-            # contract here rather than silently rounding continuous values.
             for tick in range(vertex_time[0], vertex_time[1] + 1):
                 if (agent, vertex, tick) not in pos_cons:
                     return False
 
-        if check_edge and edge_time is not None and canonical_edge in constraints:
-            for con in constraints[canonical_edge]:
-                if con[0] == agent and ConstraintAstar.overlapping(edge_time, con[1]):
+        if edge in constraints:
+            for con in constraints[edge]:
+                if con[0] == agent and self.overlap(edge_time, con[1]):
                     return False
 
         if vertex in constraints:
             for con in constraints[vertex]:
-                if con[0] == agent and ConstraintAstar.overlapping(vertex_time, con[1]):
+                if con[0] == agent and self.overlap(vertex_time, con[1]):
                     return False
 
         return True
+
+    @staticmethod
+    def overlap(t1, t2):
+        return (t1[0] <= t2[0] <= t1[1]) or \
+               (t2[0] <= t1[0] <= t2[1])

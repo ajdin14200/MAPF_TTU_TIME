@@ -200,15 +200,24 @@ class STNU:
             for i, (node_id, _) in enumerate(nodes):
                 x = (i + 1) * x_gap
 
-                # place A, T, L slightly separated
-                if f"{node_id}_A" in self.timepoints:
-                    pos[f"{node_id}_A"] = (x, y + 0.5)
+                # Place arrival/task-start/task-end/leaving timepoints separately.
+                # Task nodes follow the paper's A -> TS -> TE -> L structure.
+                has_task = (
+                    f"{node_id}_TS" in self.timepoints
+                    or f"{node_id}_TE" in self.timepoints
+                )
 
-                if f"{node_id}_T" in self.timepoints:
-                    pos[f"{node_id}_T"] = (x, y)
+                if f"{node_id}_A" in self.timepoints:
+                    pos[f"{node_id}_A"] = (x, y + (0.75 if has_task else 0.5))
+
+                if f"{node_id}_TS" in self.timepoints:
+                    pos[f"{node_id}_TS"] = (x, y + 0.25)
+
+                if f"{node_id}_TE" in self.timepoints:
+                    pos[f"{node_id}_TE"] = (x, y - 0.25)
 
                 if f"{node_id}_L" in self.timepoints:
-                    pos[f"{node_id}_L"] = (x, y - 0.5)
+                    pos[f"{node_id}_L"] = (x, y - (0.75 if has_task else 0.5))
 
         # -----------------------------
         # Draw graph
@@ -256,8 +265,22 @@ def arrival_tp(node_id):
     return f"{node_id}_A"
 
 
+def task_start_tp(node_id):
+    return f"{node_id}_TS"
+
+
+def task_end_tp(node_id):
+    return f"{node_id}_TE"
+
+
 def task_tp(node_id):
-    return f"{node_id}_T"
+    """Backward-compatible alias for the task-end timepoint.
+
+    The original implementation used a single ``_T`` timepoint.  The fixed
+    implementation follows the paper and uses distinct ``_TS`` (controllable
+    task start) and ``_TE`` (uncontrollable task end) timepoints.
+    """
+    return task_end_tp(node_id)
 
 
 def leaving_tp(node_id):
@@ -279,34 +302,130 @@ def get_agent_nodes_in_order(tpg):
 
     return per_agent
 
-def tpg_to_stnu(tpg, edges_and_weights, subgoal_action_time=None):
+def _get_agent_task_duration(subgoal_action_time, agent, location, agent_subgoals=None):
+    """Return the task-duration interval for ``agent`` at ``location``.
+
+    Two explicit, agent-aware input formats are supported:
+
+    1. Preferred combined format::
+
+           subgoal_action_time = {
+               agent_id: {
+                   location: (lb, ub),
+                   ...
+               },
+               ...
+           }
+
+       In this form the presence of ``location`` in the per-agent mapping also
+       encodes ownership of the task.
+
+    2. Paper-style split format::
+
+           subgoal_action_time = {location: (lb, ub), ...}
+           agent_subgoals = {agent_id: {location, ...}, ...}
+
+       This mirrors the paper's global task-duration function psi(v) together
+       with the agent-specific intermediate-goal set M_a.
+
+    The old global ``{location: (lb, ub)}`` format *without* ``agent_subgoals``
+    is deliberately rejected: by itself it cannot tell whether an agent owns a
+    task or is merely passing through the same location.
     """
-    Convert a TPG into an STNU.
+    if not subgoal_action_time:
+        return None
 
-    Node semantics:
-    - normal node N:
-        N_A, N_L
-        requirement: (N_A, N_L, 0, INF)
+    if agent_subgoals is not None:
+        owned_locations = agent_subgoals.get(agent, ())
+        if location not in owned_locations:
+            return None
+        if location not in subgoal_action_time:
+            raise ValueError(
+                f"Agent {agent} owns a task at {location}, but no duration "
+                "is present in subgoal_action_time."
+            )
+        return subgoal_action_time[location]
 
-    - subgoal node N:
-        N_A, N_T, N_L
-        contingent:  (N_A, N_T, lb, ub)
-        requirement: (N_T, N_L, 0, INF)
+    per_agent = subgoal_action_time.get(agent)
+    if per_agent is None:
+        return None
 
+    if not isinstance(per_agent, dict):
+        raise ValueError(
+            "Agent-specific task ownership is required. Pass "
+            "subgoal_action_time as {agent: {location: (lb, ub)}} or pass "
+            "agent_subgoals={agent: {location, ...}} together with the "
+            "paper-style global {location: (lb, ub)} duration mapping."
+        )
+
+    return per_agent.get(location)
+
+
+def tpg_to_stnu(tpg, edges_and_weights, subgoal_action_time=None, agent_subgoals=None):
+    """Convert a TPG into an STNU using the construction from the paper.
+
+    Node semantics
+    --------------
+    Normal node N::
+
+        N_A --[0, INF] requirement--> N_L
+
+    Task/subgoal node N::
+
+        N_A  --[0, INF] requirement--> N_TS
+        N_TS --[lb, ub] contingent---> N_TE
+        N_TE --[0, INF] requirement--> N_L
+
+    Thus ``N_TS`` is controllable and ``N_TE`` is uncontrollable.  This is the
+    key difference from the original implementation, which attached the task
+    contingent link directly to the arrival timepoint.
+
+    Task ownership
+    --------------
+    ``subgoal_action_time`` should preferably be agent-specific::
+
+        {
+            agent_id: {location: (lb, ub), ...},
+            ...
+        }
+
+    Alternatively, to mirror the notation in the paper, use a global duration
+    mapping plus explicit agent ownership::
+
+        subgoal_action_time = {location: (lb, ub), ...}
+        agent_subgoals = {agent_id: {location, ...}, ...}
+
+    A task is performed only on the first visit to a location assigned to that
+    agent.  An agent that merely passes through another agent's task location
+    gets a normal arrival-to-leaving requirement instead.
+
+    TPG edge semantics
+    ------------------
     Type-1 edge:
-    - from source_L to target_A
-    - requirement if duration interval has size 0
-    - contingent otherwise
+        source_L -> target_A, with the traversal interval.  Deterministic
+        intervals are requirements; uncertain intervals are contingent links.
 
     Type-2 edge:
-    - from source_L to target_A
-    - requirement: (source_L, target_A, 1, INF)
+        source_L -> target_A with requirement [1, INF].
     """
 
     stnu = STNU()
 
     if subgoal_action_time is None:
         subgoal_action_time = {}
+
+    # Without an explicit agent_subgoals mapping, the task-duration mapping
+    # itself must encode ownership as {agent: {location: (lb, ub)}}.  Reject
+    # the old global {location: (lb, ub)} form instead of silently assigning
+    # tasks to every agent that happens to visit the location.
+    if subgoal_action_time and agent_subgoals is None:
+        if not all(isinstance(per_agent, dict) for per_agent in subgoal_action_time.values()):
+            raise ValueError(
+                "Agent-specific task ownership is required. Pass "
+                "subgoal_action_time as {agent: {location: (lb, ub)}} or pass "
+                "agent_subgoals={agent: {location, ...}} together with the "
+                "paper-style global {location: (lb, ub)} duration mapping."
+            )
 
     stnu.add_timepoint("S")
     stnu.add_timepoint("F")
@@ -329,27 +448,41 @@ def tpg_to_stnu(tpg, edges_and_weights, subgoal_action_time=None):
             stnu.add_timepoint(n_a)
             stnu.add_timepoint(n_l)
 
+            task_duration = _get_agent_task_duration(
+                subgoal_action_time,
+                agent,
+                node.location,
+                agent_subgoals=agent_subgoals,
+            )
+
             is_subgoal_task = (
-                node.location in subgoal_action_time
+                task_duration is not None
                 and node.location not in performed_subgoal_action[agent]
             )
 
             if is_subgoal_task:
-                n_t = task_tp(node_id)
-                stnu.add_timepoint(n_t)
+                n_ts = task_start_tp(node_id)
+                n_te = task_end_tp(node_id)
+                stnu.add_timepoint(n_ts)
+                stnu.add_timepoint(n_te)
 
-                lb, ub = subgoal_action_time[node.location]
+                lb, ub = task_duration
 
-                # Task duration
-                stnu.add_contingent(n_a, n_t, lb, ub)
+                # The agent may wait after arrival before starting its task.
+                stnu.add_requirement(n_a, n_ts, 0, INF)
 
-                # Can leave any time after task is finished
-                stnu.add_requirement(n_t, n_l, 0, INF)
+                # Task duration is uncertain: controllable start ->
+                # uncontrollable end, exactly as in the paper.
+                stnu.add_contingent(n_ts, n_te, lb, ub)
 
+                # The agent may leave any time after the task is finished.
+                stnu.add_requirement(n_te, n_l, 0, INF)
+
+                # A task is executed only once, on the first visit.
                 performed_subgoal_action[agent].add(node.location)
 
             else:
-                # Normal node: can leave any time after arrival
+                # Normal node: can leave any time after arrival.
                 stnu.add_requirement(n_a, n_l, 0, INF)
 
     # --------------------------------------------------
