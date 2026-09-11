@@ -40,6 +40,9 @@ def run_exp(test_map, max_agent, time_uncertainty, task_uncertainty, time_limit,
 
     test_map.generate_agents_with_subgoals(max_agent, 3)
     subgoal_action_time = test_map.generate_subgoal_action_time(uncertainty=task_uncertainty)
+    agent_subgoals = {agent_id: [goals[i] for i in range(len(goals)-1)] for agent_id, goals in test_map.goal_positions.items()}
+    # print(test_map.goal_positions)
+    # print(agent_subgoals)
     test_map.fill_heuristic_table_with_goal_list()
 
     print("////////// PIBT_STNU //////////")
@@ -52,10 +55,11 @@ def run_exp(test_map, max_agent, time_uncertainty, task_uncertainty, time_limit,
     execution_time = solution.time_to_solve
     duration_stnu = 0
     if solution.is_solved:
+        print_solution(solution)
         start = time.time()
         tpg = build_tpg_from_solution(solution)
         start_stnu = time.time()
-        stnu = tpg_to_stnu(tpg, test_map.edges_and_weights, subgoal_action_time=test_map.subgoal_action_time)
+        stnu = tpg_to_stnu(tpg, test_map.edges_and_weights, subgoal_action_time=test_map.subgoal_action_time, agent_subgoals=agent_subgoals)
         print("time limit : ", time_limit)
         print("time to solve : ", solution.time_to_solve)
         print("stnu time limit : ", time_limit - solution.time_to_solve)
@@ -66,6 +70,7 @@ def run_exp(test_map, max_agent, time_uncertainty, task_uncertainty, time_limit,
         if execution_time < time_limit and stnu.solved:
             solved = True
             cost = stnu.get_cost()
+            # stnu.visualize_stnu_ordered(tpg)
 
     data.append([name_instance, "PIBT_STNU", solved, cost,
                  execution_time, solution.time_to_solve, duration_stnu])
@@ -100,7 +105,7 @@ if __name__ == "__main__":
 
         folder_name = args.map +'_'+ 'min_'+ args.min_agents + '_' + 'max_' + args.max_agents + '_TU_' + args.time_uncertainty + '_TAU_' + args.task_uncertainty
         folder_path = Path(os.path.join(os.path.dirname(__file__), '../results/' + folder_name))
-
+        print(folder_path)
         if folder_path.exists():
             shutil.rmtree(folder_path)
 

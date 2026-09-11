@@ -7,8 +7,8 @@ from pathlib import Path
 import shutil
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../"))
 
-from pathfinding.planners.cbs_ttu import CBSTTU_Planner
-from pathfinding.planners.utils.STNU import tpg_to_stnu
+from pathfinding.planners.cbs_ttu_wait_before_task_start import CBSTTU_Planner
+from pathfinding.planners.utils.STNU_task_start_timepoint import tpg_to_stnu
 from pathfinding.planners.utils.tpg import build_tpg_from_solution
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../"))
